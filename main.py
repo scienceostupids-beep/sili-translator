@@ -1,24 +1,9 @@
-"""
-HTTPS Cloud Function: translate text via deep_translator (GoogleTranslator).
-
-Called only by the Node RTDB function (server-to-server). Protect with
-TRANSLATE_INTERNAL_SECRET (same value as Node env TRANSLATE_INTERNAL_SECRET).
-
-Note: deep_translator uses unofficial Google Translate endpoints; reliability
-and ToS differ from Cloud Translation API. No extra Google API billing, but
-not suitable for all production loads.
-"""
-
-import json
 import os
 import re
 import requests
-
+from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi.responses import JSONResponse
 from deep_translator import GoogleTranslator
-from firebase_admin import initialize_app
-from firebase_functions import https_fn, options
-
-initialize_app()
 
 # WARNING: SSL verification is disabled below as requested
 requests.packages.urllib3.disable_warnings()
@@ -28,9 +13,10 @@ def _new_request(self, *args, **kwargs):
     return _old_request(self, *args, **kwargs)
 requests.Session.request = _new_request
 
-# Plain text only; avoid huge payloads
-MAX_CHARS = 15000
+app = FastAPI()
 
+MAX_CHARS = 15000
+INTERNAL_SECRET = os.environ.get("TRANSLATE_INTERNAL_SECRET", "sili_internal_translate_secret_2024")
 
 def _normalize_target(code: str) -> str:
     """Map app canonical codes to targets GoogleTranslator accepts."""
@@ -47,71 +33,50 @@ def _normalize_target(code: str) -> str:
             return f"{base}-{region.upper()}"
     return c
 
+@app.post("/translate")
+async def deep_translate_http(request: Request, x_internal_secret: str = Header(None)):
+    if not INTERNAL_SECRET.strip():
+        return JSONResponse({"ok": False, "error": "server_misconfigured"}, status_code=500)
 
-# Hardcoded for project: sili-ca40d
-INTERNAL_SECRET = "sili_internal_translate_secret_2024"
-
-
-def _is_configured() -> bool:
-    return bool(INTERNAL_SECRET.strip())
-
-
-def _resp(data: dict, status: int) -> https_fn.Response:
-    return https_fn.Response(
-        json.dumps(data),
-        status=status,
-        mimetype="application/json",
-    )
-
-
-@https_fn.on_request(
-    region=options.SupportedRegion.EUROPE_WEST1,
-    timeout_sec=120,
-)
-def deep_translate_http(req: https_fn.Request) -> https_fn.Response:
-    if req.method != "POST":
-        return _resp({"ok": False, "error": "method_not_allowed"}, 405)
-
-    if not _is_configured():
-        return _resp({"ok": False, "error": "server_misconfigured"}, 500)
-
-    expected = INTERNAL_SECRET.strip()
-    got = (req.headers.get("X-Internal-Secret") or "").strip()
-    if got != expected:
-        return _resp({"ok": False, "error": "forbidden"}, 403)
+    if (x_internal_secret or "").strip() != INTERNAL_SECRET.strip():
+        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
 
     try:
-        body = req.get_json(silent=True) or {}
-    except Exception:  # pylint: disable=broad-exception-caught
+        body = await request.json()
+    except Exception:
         body = {}
 
     text = body.get("text")
     target = body.get("target")
 
     if not isinstance(text, str) or not text.strip():
-        return _resp({"ok": False, "error": "missing_text"}, 400)
+        return JSONResponse({"ok": False, "error": "missing_text"}, status_code=400)
     if not isinstance(target, str) or not target.strip():
-        return _resp({"ok": False, "error": "missing_target"}, 400)
+        return JSONResponse({"ok": False, "error": "missing_target"}, status_code=400)
 
     plain = text.strip()
     if len(plain) > MAX_CHARS:
         plain = plain[:MAX_CHARS]
 
-    # Skip if nothing translatable (only whitespace / punctuation)
     if not re.search(r"\w", plain, re.UNICODE):
-        return _resp({"ok": True, "translated": plain, "skipped": True}, 200)
+        return JSONResponse({"ok": True, "translated": plain, "skipped": True}, status_code=200)
 
     target_norm = _normalize_target(target)
-
     try:
         translated = GoogleTranslator(
             source="auto",
             target=target_norm,
         ).translate(plain)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        return _resp({"ok": False, "error": str(exc)}, 502)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
 
     if not translated or not str(translated).strip():
-        return _resp({"ok": False, "error": "empty_translation"}, 502)
+        return JSONResponse({"ok": False, "error": "empty_translation"}, status_code=502)
 
-    return _resp({"ok": True, "translated": str(translated).strip()}, 200)
+    return {"ok": True, "translated": str(translated).strip()}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Render passes the PORT environment variable automatically
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
