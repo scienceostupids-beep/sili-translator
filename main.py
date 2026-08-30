@@ -1,7 +1,7 @@
 import os
 import re
 import requests
-from fastapi import FastAPI, HTTPException, Request, Header
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from deep_translator import GoogleTranslator
 
@@ -16,7 +16,9 @@ requests.Session.request = _new_request
 app = FastAPI()
 
 MAX_CHARS = 15000
-INTERNAL_SECRET = os.environ.get("TRANSLATE_INTERNAL_SECRET", "sili_internal_translate_secret_2024")
+
+# HARDCODED SECRET (No environment variables needed on Render's dashboard)
+INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 
 def _normalize_target(code: str) -> str:
     """Map app canonical codes to targets GoogleTranslator accepts."""
@@ -77,6 +79,6 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
 
 if __name__ == "__main__":
     import uvicorn
-    # Render passes the PORT environment variable automatically
+    # This must remain dynamic so Render can successfully assign its dynamic port
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
