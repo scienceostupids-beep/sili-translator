@@ -1,10 +1,9 @@
 import os
 import re
-import time
 import requests
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse, HTMLResponse
-from deep_translator import MyMemoryTranslator
+from fastapi.responses import JSONResponse, PlainTextResponse
+from deep_translator import GoogleTranslator, MyMemoryTranslator
 
 # WARNING: SSL verification is disabled below as requested
 requests.packages.urllib3.disable_warnings()
@@ -14,13 +13,14 @@ def _new_request(self, *args, **kwargs):
     return _old_request(self, *args, **kwargs)
 requests.Session.request = _new_request
 
-app = FastAPI()
+# Disabling docs_url and redoc_url completely removes the testing/documentation pages
+app = FastAPI(docs_url=None, redoc_url=None)
 
 MAX_CHARS = 15000
 INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 
 def _normalize_target(code: str) -> str:
-    """Map app canonical codes to targets MyMemoryTranslator accepts."""
+    """Map app canonical codes to targets translators accept."""
     c = (code or "en").strip().lower()
     special = {
         "zh-cn": "zh-CN",
@@ -34,69 +34,22 @@ def _normalize_target(code: str) -> str:
             return f"{base}-{region.upper()}"
     return c
 
-@app.get("/", response_class=HTMLResponse)
-async def root_dashboard():
-    """Renders a simple UI dashboard listing all endpoints when accessing the root URL."""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Sili Translator API Dashboard</title>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #0f172a; color: #f8fafc; padding: 40px; margin: 0; }
-            .container { max-width: 800px; margin: 0 auto; background: #1e293b; padding: 30px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
-            h1 { color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; margin-top: 0; }
-            p { color: #94a3b8; }
-            .endpoint { border: 1px solid #334155; border-radius: 8px; padding: 15px; margin: 20px 0; background: #0f172a; }
-            .method { display: inline-block; padding: 4px 8px; border-radius: 4px; font-weight: bold; font-size: 14px; margin-right: 10px; }
-            .method.post { background-color: #10b981; color: #fff; }
-            .method.get { background-color: #3b82f6; color: #fff; }
-            .url { font-family: monospace; font-size: 16px; color: #e2e8f0; }
-            .desc { margin: 10px 0 0 0; font-size: 14px; color: #94a3b8; }
-            .btn-docs { display: inline-block; background-color: #38bdf8; color: #0f172a; padding: 10px 20px; text-decoration: none; border-radius: 6px; font-weight: bold; margin-top: 15px; transition: opacity 0.2s; }
-            .btn-docs:hover { opacity: 0.9; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Sili Translator API Dashboard (MyMemory Engine)</h1>
-            <p>Your translation microservice is live and running perfectly on Render.</p>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span class="url">/</span>
-                <p class="desc">Root path. Shows this endpoints dashboard overview UI.</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span class="url">/health</span>
-                <p class="desc">Health check path. Returns server status for uptime monitoring pings.</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method post">POST</span>
-                <span class="url">/translate</span>
-                <p class="desc">Main service path. Accepts translation requests via server-to-server calls.</p>
-            </div>
-            
-            <div class="endpoint">
-                <span class="method get">GET</span>
-                <span class="url">/docs</span>
-                <p class="desc">Interactive OpenAPI/Swagger user interface. Allows full live request testing right inside your web browser.</p>
-            </div>
-
-            <a href="/docs" class="btn-docs">Open Interactive Testing UI</a>
-        </div>
-    </body>
-    </html>
-    """
-    return html_content
+@app.get("/", response_class=PlainTextResponse)
+async def root_simple():
+    """Ultra-simple, minimal plain text overview of the service endpoints."""
+    return (
+        "Sili Translator API\n"
+        "===================\n"
+        "Status: Active\n\n"
+        "Endpoints:\n"
+        "- GET  /health     -> System health check\n"
+        "- POST /translate -> Secure translation processor\n"
+    )
 
 @app.get("/health")
 async def health_check():
     """Simple ping route to monitor deployment status."""
-    return {"status": "healthy", "timestamp": time.time()}
+    return {"status": "healthy"}
 
 @app.post("/translate")
 async def deep_translate_http(request: Request, x_internal_secret: str = Header(None)):
@@ -116,7 +69,7 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
 
     if not isinstance(text, str) or not text.strip():
         return JSONResponse({"ok": False, "error": "missing_text"}, status_code=400)
-    if not isinstance(target, str) or not text.strip():
+    if not isinstance(target, str) or not target.strip():
         return JSONResponse({"ok": False, "error": "missing_target"}, status_code=400)
 
     plain = text.strip()
@@ -127,20 +80,33 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
         return JSONResponse({"ok": True, "translated": plain, "skipped": True}, status_code=200)
 
     target_norm = _normalize_target(target)
-    
-    try:
-        # Switched engine to MyMemory to maintain 100% stability on cloud instances
-        translated = MyMemoryTranslator(
-            source="auto",
-            target=target_norm,
-        ).translate(plain)
-    except Exception as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
-            
-    if not translated or not str(translated).strip():
-        return JSONResponse({"ok": False, "error": "empty_translation"}, status_code=502)
+    translated = None
+    engine_used = "none"
+    last_error = ""
 
-    return {"ok": True, "translated": str(translated).strip()}
+    # PRIMARY ENGINE: Google Translate
+    try:
+        translated = GoogleTranslator(source="auto", target=target_norm).translate(plain)
+        if translated and str(translated).strip():
+            engine_used = "google"
+    except Exception as e:
+        last_error = f"Google engine failed: {str(e)}"
+
+    # SECONDARY FALLBACK ENGINE: MyMemory Translate (Triggers automatically if Google throws errors)
+    if not translated or not str(translated).strip():
+        try:
+            fallback_target = target_norm.split("-")[0] if "-" in target_norm else target_norm
+            translated = MyMemoryTranslator(source="auto", target=fallback_target).translate(plain)
+            if translated and str(translated).strip():
+                engine_used = "mymemory"
+        except Exception as e:
+            last_error += f" | MyMemory engine fallback failed: {str(e)}"
+
+    # Final evaluation validation
+    if not translated or not str(translated).strip():
+        return JSONResponse({"ok": False, "error": f"All engines exhausted. Details: {last_error}"}, status_code=502)
+
+    return {"ok": True, "translated": str(translated).strip(), "engine": engine_used}
 
 if __name__ == "__main__":
     import uvicorn
