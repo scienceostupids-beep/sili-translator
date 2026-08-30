@@ -4,7 +4,7 @@ import time
 import requests
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, HTMLResponse
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 
 # WARNING: SSL verification is disabled below as requested
 requests.packages.urllib3.disable_warnings()
@@ -20,7 +20,7 @@ MAX_CHARS = 15000
 INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 
 def _normalize_target(code: str) -> str:
-    """Map app canonical codes to targets GoogleTranslator accepts."""
+    """Map app canonical codes to targets MyMemoryTranslator accepts."""
     c = (code or "en").strip().lower()
     special = {
         "zh-cn": "zh-CN",
@@ -59,7 +59,7 @@ async def root_dashboard():
     </head>
     <body>
         <div class="container">
-            <h1>Sili Translator API Dashboard</h1>
+            <h1>Sili Translator API Dashboard (MyMemory Engine)</h1>
             <p>Your translation microservice is live and running perfectly on Render.</p>
             
             <div class="endpoint">
@@ -128,25 +128,17 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
 
     target_norm = _normalize_target(target)
     
-    # Retry loop mechanism to smooth out Google's 500 block errors
-    translated = None
-    last_exception = None
-    
-    for attempt in range(3):
-        try:
-            translated = GoogleTranslator(
-                source="auto",
-                target=target_norm,
-            ).translate(plain)
-            if translated and str(translated).strip():
-                break  # Break out if successful translation achieved
-        except Exception as exc:
-            last_exception = exc
-            time.sleep(1)  # Brief pause before retrying
+    try:
+        # Switched engine to MyMemory to maintain 100% stability on cloud instances
+        translated = MyMemoryTranslator(
+            source="auto",
+            target=target_norm,
+        ).translate(plain)
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=502)
             
     if not translated or not str(translated).strip():
-        error_msg = str(last_exception) if last_exception else "empty_translation"
-        return JSONResponse({"ok": False, "error": error_msg}, status_code=502)
+        return JSONResponse({"ok": False, "error": "empty_translation"}, status_code=502)
 
     return {"ok": True, "translated": str(translated).strip()}
 
