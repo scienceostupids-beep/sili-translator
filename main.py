@@ -3,40 +3,29 @@ import re
 import requests
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
-from deep_translator import GoogleTranslator, MyMemoryTranslator
+from libretranslatepy import LibreTranslateAPI
 
-# WARNING: SSL verification is disabled below as requested
+# Disable warnings as requested
 requests.packages.urllib3.disable_warnings()
-_old_request = requests.Session.request
-def _new_request(self, *args, **kwargs):
-    kwargs['verify'] = False
-    return _old_request(self, *args, **kwargs)
-requests.Session.request = _new_request
 
-# Disabling docs_url and redoc_url completely removes the testing/documentation pages
 app = FastAPI(docs_url=None, redoc_url=None)
 
 MAX_CHARS = 15000
 INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 
+# Set up primary and secondary free LibreTranslate infrastructure endpoints
+PRIMARY_LT = LibreTranslateAPI("https://discuss.online")
+FALLBACK_LT = LibreTranslateAPI("https://libretranslate.de")
+
 def _normalize_target(code: str) -> str:
-    """Map app canonical codes to targets translators accept."""
+    """Standardizes language codes for the LibreTranslate engine."""
     c = (code or "en").strip().lower()
-    special = {
-        "zh-cn": "zh-CN",
-        "zh-tw": "zh-TW",
-    }
-    if c in special:
-        return special[c]
     if "-" in c:
-        base, region = c.split("-", 1)
-        if len(region) <= 5:
-            return f"{base}-{region.upper()}"
+        return c.split("-", 1)[0]
     return c
 
 @app.get("/", response_class=PlainTextResponse)
 async def root_simple():
-    """Ultra-simple, minimal plain text overview of the service endpoints."""
     return (
         "Sili Translator API\n"
         "===================\n"
@@ -48,14 +37,10 @@ async def root_simple():
 
 @app.get("/health")
 async def health_check():
-    """Simple ping route to monitor deployment status."""
     return {"status": "healthy"}
 
 @app.post("/translate")
 async def deep_translate_http(request: Request, x_internal_secret: str = Header(None)):
-    if not INTERNAL_SECRET.strip():
-        return JSONResponse({"ok": False, "error": "server_misconfigured"}, status_code=500)
-
     if (x_internal_secret or "").strip() != INTERNAL_SECRET.strip():
         return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
 
@@ -84,25 +69,23 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
     engine_used = "none"
     last_error = ""
 
-    # PRIMARY ENGINE: Google Translate
+    # PRIMARY ROUTE: Discuss.online LibreTranslate mirror (Fastest)
     try:
-        translated = GoogleTranslator(source="auto", target=target_norm).translate(plain)
+        translated = PRIMARY_LT.translate(plain, "auto", target_norm)
         if translated and str(translated).strip():
-            engine_used = "google"
+            engine_used = "libre_primary"
     except Exception as e:
-        last_error = f"Google engine failed: {str(e)}"
+        last_error = f"Primary mirror failed: {str(e)}"
 
-    # SECONDARY FALLBACK ENGINE: MyMemory Translate (Triggers automatically if Google throws errors)
+    # INSTANT FALLBACK ROUTE: Main LibreTranslate node (Fires instantly if primary fails)
     if not translated or not str(translated).strip():
         try:
-            fallback_target = target_norm.split("-")[0] if "-" in target_norm else target_norm
-            translated = MyMemoryTranslator(source="auto", target=fallback_target).translate(plain)
+            translated = FALLBACK_LT.translate(plain, "auto", target_norm)
             if translated and str(translated).strip():
-                engine_used = "mymemory"
+                engine_used = "libre_fallback"
         except Exception as e:
-            last_error += f" | MyMemory engine fallback failed: {str(e)}"
+            last_error += f" | Fallback mirror failed: {str(e)}"
 
-    # Final evaluation validation
     if not translated or not str(translated).strip():
         return JSONResponse({"ok": False, "error": f"All engines exhausted. Details: {last_error}"}, status_code=502)
 
