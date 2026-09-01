@@ -1,6 +1,8 @@
 import os
+import uuid
 import uvicorn
-from fastapi import FastAPI, Request, Header, HTTPException
+import requests
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
 from google.cloud import translate
 
@@ -9,68 +11,81 @@ app = FastAPI(docs_url=None, redoc_url=None)
 # Secret header security password for your mobile app connection
 INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 
-# Official Google Project ID setup
+# ========================================================
+# ENGINE 1: AZURE AI TRANSLATOR (MAIN PRIMARY)
+# ========================================================
+# Put your values here or configure them as environment variables on Render
+AZURE_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "YOUR_KEY_1_HERE")
+AZURE_ENDPOINT = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://microsofttranslator.com")
+AZURE_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "francecentral")
+
+is_azure_configured = (
+    AZURE_KEY != "YOUR_KEY_1_HERE"
+)
+
+# ========================================================
+# ENGINE 2: GOOGLE CLOUD TRANSLATION (SECONDARY FALLBACK)
+# ========================================================
 GOOGLE_PROJECT_ID = "sili-ca40d"
 
-# Choose production secrets directory on Render, fallback to local project folder
 if os.path.exists("/etc/secrets/credentials.json"):
     CREDENTIALS_PATH = "/etc/secrets/credentials.json"
 else:
     CREDENTIALS_PATH = "credentials.json"
 
-# Initialize Google Cloud Translation Client using your file
 try:
     translate_client = translate.TranslationServiceClient.from_service_account_json(CREDENTIALS_PATH)
     parent_path = f"projects/{GOOGLE_PROJECT_ID}/locations/global"
     print(f"🚀 SUCCESS: Google Translation engine loaded from {CREDENTIALS_PATH}")
 except Exception as e:
-    print(f"❌ CRITICAL ERROR LOADING GOOGLE CREDENTIALS: {e}")
+    print(f"⚠️ WARNING: Google Credentials could not load: {e}")
     translate_client = None
 
-# Free monthly safety cap tracker (Resets on server restart)
-CHARACTER_TRACKER = {
+# ========================================================
+# SAFETY TRACKER FOR GOOGLE FALLBACK ONLY
+# ========================================================
+GOOGLE_CHARACTER_TRACKER = {
     "total_processed": 0,
-    "max_free_limit": 500000
+    "max_free_limit": 500000 
 }
 
 def _normalize_target(code: str) -> str:
-    """Standardizes language codes for the Google Cloud engine."""
+    """Standardizes language codes."""
     c = (code or "en").strip()
-    if "-" in c:
-        # Converts codes like 'en-US' or 'zh-CN' to standard format if needed
-        return c
     return c.lower()
 
+# ========================================================
+# API ROUTING DEFINITIONS
+# ========================================================
 @app.get("/", response_class=PlainTextResponse)
 async def root_simple():
     return (
-        "Sili Translator API\n"
-        "===================\n"
+        "Sili Hybrid Translator API\n"
+        "===========================\n"
         "Status: Active\n"
-        "Engine: Google Cloud Translation v3\n\n"
+        f"Primary Engine (Main): Azure AI Translator ({'CONFIGURED' if is_azure_configured else 'UNCONFIGURED'})\n"
+        f"Fallback Engine (Backup): Google Cloud v3 ({'CONFIGURED' if translate_client else 'UNCONFIGURED'})\n\n"
         "Endpoints:\n"
         "- GET  /health     -> System health check\n"
-        "- POST /translate -> Secure translation processor\n"
+        "- POST /translate -> Dual-engine secure translation processor\n"
     )
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "engine_configured": translate_client is not None,
-        "quota_used": f"{CHARACTER_TRACKER['total_processed']}/{CHARACTER_TRACKER['max_free_limit']}"
+        "azure_configured": is_azure_configured,
+        "google_configured": translate_client is not None,
+        "google_fallback_quota_used": f"{GOOGLE_CHARACTER_TRACKER['total_processed']}/{GOOGLE_CHARACTER_TRACKER['max_free_limit']}"
     }
 
 @app.post("/translate")
-async def google_translate_http(request: Request, x_internal_secret: str = Header(None, alias="X-Internal-Secret")):
+async def dual_translate_http(request: Request, x_internal_secret: str = Header(None, alias="X-Internal-Secret")):
     global translate_client
     
     # 1. Access security block authentication check
     if (x_internal_secret or "").strip() != INTERNAL_SECRET.strip():
         return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
-
-    if not translate_client:
-        return JSONResponse({"ok": False, "error": "Google Translation Engine unconfigured."}, status_code=500)
 
     try:
         body = await request.json()
@@ -87,45 +102,84 @@ async def google_translate_http(request: Request, x_internal_secret: str = Heade
 
     plain = text.strip()
     incoming_chars = len(plain)
-
-    # 2. Strict Free Tier Guard Rail: Block requests if they push you past 500k chars
-    if CHARACTER_TRACKER["total_processed"] + incoming_chars > CHARACTER_TRACKER["max_free_limit"]:
-        return JSONResponse({
-            "ok": False, 
-            "error": "Monthly free character limit protection triggered. Blocked to prevent credit card billing."
-        }, status_code=429)
-
     target_norm = _normalize_target(target)
 
-    try:
-        # 3. Fire official Google Cloud Translation Request
-        # (Note: For high concurrency, wrapping this blocking sync SDK call in anyio.to_thread is recommended)
-        response = translate_client.translate_text(
-            request={
-                "parent": parent_path,
-                "contents": [plain],
-                "mime_type": "text/plain",
-                "target_language_code": target_norm,
+    # ----------------------------------------------------
+    # ATTEMPT 1: MAIN PRIMARY ENGINE - Azure AI Translator
+    # ----------------------------------------------------
+    if is_azure_configured:
+        try:
+            base_url = AZURE_ENDPOINT.rstrip('/')
+            constructed_url = f"{base_url}/translate"
+            
+            params = {
+                'api-version': '3.0',
+                'to': target_norm
             }
-        )
-        
-        # Extract the string payload outcome safely
-        translated_text = response.translations[0].translated_text
-        
-        # Commit character tracking statistics updates
-        CHARACTER_TRACKER["total_processed"] += incoming_chars
+            headers = {
+                'Ocp-Apim-Subscription-Key': AZURE_KEY,
+                'Ocp-Apim-Subscription-Region': AZURE_REGION,
+                'Content-type': 'application/json',
+                'X-ClientTraceId': str(uuid.uuid4())
+            }
+            azure_body = [{'text': plain}]
 
-        return {
-            "ok": True, 
-            "translated": translated_text.strip(), 
-            "engine": "google_cloud_v3"
-        }
+            azure_response = requests.post(constructed_url, params=params, headers=headers, json=azure_body, timeout=5)
+            
+            if azure_response.status_code == 200:
+                res_data = azure_response.json()
+                
+                # FIXED: Correct nested list structural access for Azure API responses
+                translated_text = res_data[0]['translations'][0]['text']
+                
+                return {
+                    "ok": True, 
+                    "translated": translated_text.strip(), 
+                    "engine": "azure_ai_translator"
+                }
+            else:
+                print(f"⚠️ Primary Azure failed with status {azure_response.status_code}: {azure_response.text}. Dropping to fallback.")
+        except Exception as azure_err:
+            print(f"⚠️ Primary Azure encountered error: {azure_err}. Dropping to fallback.")
+            
+    # ----------------------------------------------------
+    # ATTEMPT 2: BACKUP FALLBACK ENGINE - Google Cloud Translation
+    # ----------------------------------------------------
+    if translate_client:
+        if GOOGLE_CHARACTER_TRACKER["total_processed"] + incoming_chars > GOOGLE_CHARACTER_TRACKER["max_free_limit"]:
+            return JSONResponse({
+                "ok": False, 
+                "error": "Google Cloud fallback protection triggered. Budget safety limit reached."
+            }, status_code=429)
 
-    except Exception as e:
-        return JSONResponse({
-            "ok": False, 
-            "error": f"Google Cloud Engine Failure: {str(e)}"
-        }, status_code=502)
+        try:
+            response = translate_client.translate_text(
+                request={
+                    "parent": parent_path,
+                    "contents": [plain],
+                    "mime_type": "text/plain",
+                    "target_language_code": target_norm,
+                }
+            )
+            
+            translated_text = response.translations[0].translated_text
+            GOOGLE_CHARACTER_TRACKER["total_processed"] += incoming_chars
+
+            return {
+                "ok": True, 
+                "translated": translated_text.strip(), 
+                "engine": "google_cloud_v3_fallback"
+            }
+        except Exception as google_err:
+            return JSONResponse({
+                "ok": False, 
+                "error": f"Both Primary and Fallback engines failed. Google error: {str(google_err)}"
+            }, status_code=502)
+
+    return JSONResponse({
+        "ok": False, 
+        "error": "Translation engines unavailable. Core service configurations missing."
+    }, status_code=500)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
