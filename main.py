@@ -62,7 +62,7 @@ async def health_check():
     }
 
 @app.post("/translate")
-async def deep_translate_http(request: Request, x_internal_secret: str = Header(None)):
+async def google_translate_http(request: Request, x_internal_secret: str = Header(None, alias="X-Internal-Secret")):
     global translate_client
     
     # 1. Access security block authentication check
@@ -99,6 +99,7 @@ async def deep_translate_http(request: Request, x_internal_secret: str = Header(
 
     try:
         # 3. Fire official Google Cloud Translation Request
+        # (Note: For high concurrency, wrapping this blocking sync SDK call in anyio.to_thread is recommended)
         response = translate_client.translate_text(
             request={
                 "parent": parent_path,
