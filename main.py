@@ -2,6 +2,7 @@ import os
 import uuid
 import uvicorn
 import requests
+import anyio  # Built natively into FastAPI's core library dependencies
 from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse, PlainTextResponse
 from google.cloud import translate
@@ -14,7 +15,6 @@ INTERNAL_SECRET = "sili_internal_translate_secret_2024"
 # ========================================================
 # ENGINE 1: AZURE AI TRANSLATOR (MAIN PRIMARY)
 # ========================================================
-# Put your values here or configure them as environment variables on Render
 AZURE_KEY = os.environ.get("AZURE_TRANSLATOR_KEY", "YOUR_KEY_1_HERE")
 AZURE_ENDPOINT = os.environ.get("AZURE_TRANSLATOR_ENDPOINT", "https://microsofttranslator.com")
 AZURE_REGION = os.environ.get("AZURE_TRANSLATOR_REGION", "francecentral")
@@ -112,10 +112,7 @@ async def dual_translate_http(request: Request, x_internal_secret: str = Header(
             base_url = AZURE_ENDPOINT.rstrip('/')
             constructed_url = f"{base_url}/translate"
             
-            params = {
-                'api-version': '3.0',
-                'to': target_norm
-            }
+            params = {'api-version': '3.0', 'to': target_norm}
             headers = {
                 'Ocp-Apim-Subscription-Key': AZURE_KEY,
                 'Ocp-Apim-Subscription-Region': AZURE_REGION,
@@ -124,42 +121,49 @@ async def dual_translate_http(request: Request, x_internal_secret: str = Header(
             }
             azure_body = [{'text': plain}]
 
-            azure_response = requests.post(constructed_url, params=params, headers=headers, json=azure_body, timeout=5)
+            # Runs network block asynchronously to allow high concurrency scales
+            azure_response = await anyio.to_thread.run_sync(
+                lambda: requests.post(constructed_url, params=params, headers=headers, json=azure_body, timeout=5)
+            )
             
             if azure_response.status_code == 200:
                 res_data = azure_response.json()
-                
-                # FIXED: Correct nested list structural access for Azure API responses
                 translated_text = res_data[0]['translations'][0]['text']
                 
+                # Zero logging on successful calls for maximum raw execution performance
                 return {
                     "ok": True, 
                     "translated": translated_text.strip(), 
                     "engine": "azure_ai_translator"
                 }
             else:
-                print(f"⚠️ Primary Azure failed with status {azure_response.status_code}: {azure_response.text}. Dropping to fallback.")
-        except Exception as azure_err:
-            print(f"⚠️ Primary Azure encountered error: {azure_err}. Dropping to fallback.")
+                # ONLY log if the API returns an error status code
+                print(f"FAIL: Azure HTTP {azure_response.status_code}")
+        except Exception:
+            # ONLY log if the request crashes/times out completely
+            print("FAIL: Azure Network Exception")
             
     # ----------------------------------------------------
     # ATTEMPT 2: BACKUP FALLBACK ENGINE - Google Cloud Translation
     # ----------------------------------------------------
     if translate_client:
         if GOOGLE_CHARACTER_TRACKER["total_processed"] + incoming_chars > GOOGLE_CHARACTER_TRACKER["max_free_limit"]:
+            print("FAIL: Google Fallback Quota Exhausted")
             return JSONResponse({
                 "ok": False, 
                 "error": "Google Cloud fallback protection triggered. Budget safety limit reached."
             }, status_code=429)
 
         try:
-            response = translate_client.translate_text(
-                request={
-                    "parent": parent_path,
-                    "contents": [plain],
-                    "mime_type": "text/plain",
-                    "target_language_code": target_norm,
-                }
+            response = await anyio.to_thread.run_sync(
+                lambda: translate_client.translate_text(
+                    request={
+                        "parent": parent_path,
+                        "contents": [plain],
+                        "mime_type": "text/plain",
+                        "target_language_code": target_norm,
+                    }
+                )
             )
             
             translated_text = response.translations[0].translated_text
@@ -170,10 +174,12 @@ async def dual_translate_http(request: Request, x_internal_secret: str = Header(
                 "translated": translated_text.strip(), 
                 "engine": "google_cloud_v3_fallback"
             }
-        except Exception as google_err:
+        except Exception:
+            # ONLY log if Google fallback crashes completely
+            print("FAIL: Google Fallback API Exception")
             return JSONResponse({
                 "ok": False, 
-                "error": f"Both Primary and Fallback engines failed. Google error: {str(google_err)}"
+                "error": "Both Primary and Fallback engines failed."
             }, status_code=502)
 
     return JSONResponse({
